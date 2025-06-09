@@ -31,6 +31,19 @@ import (
 
 var cachedBootTime time.Time
 
+var ianaProtocolNumberToText = map[string]string{
+	"1":   "icmp",
+	"2":   "igmp",
+	"6":   "tcp",
+	"17":  "udp",
+	"47":  "gre",
+	"50":  "esp",
+	"51":  "ah",
+	"88":  "eigrp",
+	"89":  "ospf",
+	"115": "l2tp",
+}
+
 func GetBootTime() time.Time {
 	if !cachedBootTime.IsZero() {
 		return cachedBootTime
@@ -298,8 +311,7 @@ func EnrichWithConnectionInformationTransport(
 	transportNumberString := strconv.Itoa(int(transportNumber))
 
 	ecsNetwork.IanaNumber = transportNumberString
-	// TODO: Fix when dependency works.
-	//ecsNetwork.Transport = packet_logging.IanaProtocolNumberToText[transportNumberString]
+	ecsNetwork.Transport = ianaProtocolNumberToText[transportNumberString]
 }
 
 func EnrichWithProcessInformation(
