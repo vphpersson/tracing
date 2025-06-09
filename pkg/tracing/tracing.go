@@ -71,53 +71,42 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 		}
 	}()
 
-	go func() {
-		<-ctx.Done()
-		if err := ringbufReader.Close(); err != nil {
-			slog.WarnContext(
-				motmedelContext.WithErrorContextValue(
-					ctx,
-					motmedelErrors.NewWithTrace(
-						fmt.Errorf("ringbuf reader close: %w", err),
-						ringbufReader,
-					),
-				),
-				"An error occurred when closing a ringbuf reader.",
-			)
-		}
-	}()
-
 	for {
-		record, err := ringbufReader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return nil
-			}
-
-			return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf read: %w", err), ringbufReader)
-		}
-
-		if callback != nil {
-			go func() {
-				var event T
-
-				err := binary.Read(bytes.NewBuffer(record.RawSample), binary.BigEndian, &event)
-				if err != nil {
-					slog.ErrorContext(
-						motmedelContext.WithErrorContextValue(
-							ctx,
-							motmedelErrors.NewWithTrace(
-								fmt.Errorf("binary read: %w", err),
-								record.RawSample,
-							),
-						),
-						"An error occurred when parsing a record.",
-					)
-					return
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			record, err := ringbufReader.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return nil
 				}
 
-				callback(&event)
-			}()
+				return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf read: %w", err), ringbufReader)
+			}
+
+			if callback != nil {
+				go func() {
+					var event T
+
+					err := binary.Read(bytes.NewBuffer(record.RawSample), binary.BigEndian, &event)
+					if err != nil {
+						slog.ErrorContext(
+							motmedelContext.WithErrorContextValue(
+								ctx,
+								motmedelErrors.NewWithTrace(
+									fmt.Errorf("binary read: %w", err),
+									record.RawSample,
+								),
+							),
+							"An error occurred when parsing a record.",
+						)
+						return
+					}
+
+					callback(&event)
+				}()
+			}
 		}
 	}
 }
