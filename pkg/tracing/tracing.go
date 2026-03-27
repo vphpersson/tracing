@@ -1,14 +1,5 @@
 package tracing
 
-/*
-   #include <time.h>
-   static unsigned long long get_nsecs(void) {
-       struct timespec ts;
-       clock_gettime(CLOCK_BOOTTIME, &ts);
-       return (unsigned long long)ts.tv_sec * 1000000000UL + ts.tv_nsec;
-   }
-*/
-import "C"
 import (
 	"bytes"
 	"context"
@@ -22,14 +13,19 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	tracingErrors "github.com/vphpersson/tracing/pkg/errors"
+	"golang.org/x/sys/unix"
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
 
-var cachedBootTime time.Time
+var (
+	cachedBootTime     time.Time
+	cachedBootTimeOnce sync.Once
+)
 
 var ianaProtocolNumberToText = map[string]string{
 	"1":   "icmp",
@@ -45,10 +41,11 @@ var ianaProtocolNumberToText = map[string]string{
 }
 
 func GetBootTime() time.Time {
-	if !cachedBootTime.IsZero() {
-		return cachedBootTime
-	}
-	cachedBootTime = time.Now().Add(-(time.Duration(uint64(C.get_nsecs())) * time.Nanosecond))
+	cachedBootTimeOnce.Do(func() {
+		var ts unix.Timespec
+		unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts)
+		cachedBootTime = time.Now().Add(-time.Duration(ts.Nano()) * time.Nanosecond)
+	})
 	return cachedBootTime
 }
 
@@ -72,10 +69,10 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 	defer func() {
 		if err := ringbufReader.Close(); err != nil {
 			slog.WarnContext(
-				motmedelContext.WithErrorContextValue(
+				motmedelContext.WithError(
 					ctx,
 					motmedelErrors.NewWithTrace(
-						fmt.Errorf("ringbuf reader close: %w", ringbufReader.Close()),
+						fmt.Errorf("ringbuf reader close: %w", err),
 						ringbufReader,
 					),
 				),
@@ -84,42 +81,42 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 		}
 	}()
 
+	go func() {
+		<-ctx.Done()
+		ringbufReader.Close()
+	}()
+
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			record, err := ringbufReader.Read()
-			if err != nil {
-				if errors.Is(err, ringbuf.ErrClosed) {
-					return nil
+		record, err := ringbufReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return nil
+			}
+
+			return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf read: %w", err), ringbufReader)
+		}
+
+		if callback != nil {
+			go func() {
+				var event T
+
+				err := binary.Read(bytes.NewBuffer(record.RawSample), binary.BigEndian, &event)
+				if err != nil {
+					slog.ErrorContext(
+						motmedelContext.WithError(
+							ctx,
+							motmedelErrors.NewWithTrace(
+								fmt.Errorf("binary read: %w", err),
+								record.RawSample,
+							),
+						),
+						"An error occurred when parsing a record.",
+					)
+					return
 				}
 
-				return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf read: %w", err), ringbufReader)
-			}
-
-			if callback != nil {
-				go func() {
-					var event T
-
-					err := binary.Read(bytes.NewBuffer(record.RawSample), binary.BigEndian, &event)
-					if err != nil {
-						slog.ErrorContext(
-							motmedelContext.WithErrorContextValue(
-								ctx,
-								motmedelErrors.NewWithTrace(
-									fmt.Errorf("binary read: %w", err),
-									record.RawSample,
-								),
-							),
-							"An error occurred when parsing a record.",
-						)
-						return
-					}
-
-					callback(&event)
-				}()
-			}
+				callback(&event)
+			}()
 		}
 	}
 }
@@ -140,7 +137,7 @@ func RunTracingMapReceiver[T any](ctx context.Context, program *ebpf.Program, eb
 	defer func() {
 		if err := tracingLink.Close(); err != nil {
 			slog.WarnContext(
-				motmedelContext.WithErrorContextValue(
+				motmedelContext.WithError(
 					ctx,
 					motmedelErrors.NewWithTrace(
 						fmt.Errorf("tracing link close: %w", err),
@@ -190,7 +187,7 @@ func RunTracepointMapReceiver[T any](
 	defer func() {
 		if err := tracepointLink.Close(); err != nil {
 			slog.WarnContext(
-				motmedelContext.WithErrorContextValue(
+				motmedelContext.WithError(
 					ctx,
 					motmedelErrors.NewWithTrace(
 						fmt.Errorf("tracepoint link close: %w", err),
