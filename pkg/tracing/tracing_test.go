@@ -5,11 +5,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Motmedel/ecs_go/ecs"
+	"github.com/Motmedel/utils_go/pkg/schema"
 )
 
 func TestGetBootTime(t *testing.T) {
-	bootTime := GetBootTime()
+	bootTime, err := GetBootTime()
+	if err != nil {
+		t.Fatalf("GetBootTime returned error: %v", err)
+	}
 	if bootTime.IsZero() {
 		t.Fatal("GetBootTime returned zero time")
 	}
@@ -19,8 +22,8 @@ func TestGetBootTime(t *testing.T) {
 }
 
 func TestGetBootTimeIdempotent(t *testing.T) {
-	a := GetBootTime()
-	b := GetBootTime()
+	a, _ := GetBootTime()
+	b, _ := GetBootTime()
 	if !a.Equal(b) {
 		t.Fatalf("GetBootTime returned different values: %v vs %v", a, b)
 	}
@@ -93,7 +96,7 @@ func TestEnrichWithSourceUserNilBase(t *testing.T) {
 }
 
 func TestEnrichWithSourceUser(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	EnrichWithSourceUser(base, 1000)
 
 	if base.Source == nil {
@@ -108,7 +111,7 @@ func TestEnrichWithSourceUser(t *testing.T) {
 }
 
 func TestEnrichWithSourceUserExistingSource(t *testing.T) {
-	base := &ecs.Base{Source: &ecs.Target{Ip: "10.0.0.1"}}
+	base := &schema.Base{Source: &schema.Target{Ip: "10.0.0.1"}}
 	EnrichWithSourceUser(base, 500)
 
 	if base.Source.Ip != "10.0.0.1" {
@@ -125,7 +128,7 @@ func TestEnrichWithConnectionInformationNilBase(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationIPv4(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 	src[0], src[1], src[2], src[3] = 10, 0, 0, 1
 	dst[0], dst[1], dst[2], dst[3] = 10, 0, 0, 2
@@ -159,7 +162,7 @@ func TestEnrichWithConnectionInformationIPv4(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationIPv6(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 	src[15] = 1 // ::1
 	dst[15] = 2 // ::2
@@ -178,7 +181,7 @@ func TestEnrichWithConnectionInformationIPv6(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationUnknownFamily(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 	EnrichWithConnectionInformation(base, src, 80, dst, 443, 9999)
 
@@ -193,7 +196,7 @@ func TestEnrichWithConnectionInformationTransportNilBase(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportTCP(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 	src[0], src[1], src[2], src[3] = 10, 0, 0, 1
 	dst[0], dst[1], dst[2], dst[3] = 10, 0, 0, 2
@@ -215,7 +218,7 @@ func TestEnrichWithConnectionInformationTransportTCP(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportUDP(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 
 	EnrichWithConnectionInformationTransport(base, src, 0, dst, 0, syscall.AF_INET, 17)
@@ -226,7 +229,7 @@ func TestEnrichWithConnectionInformationTransportUDP(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportZero(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 
 	EnrichWithConnectionInformationTransport(base, src, 80, dst, 443, syscall.AF_INET, 0)
@@ -243,7 +246,7 @@ func TestEnrichWithConnectionInformationTransportZero(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportUnknownProtocol(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var src, dst [16]byte
 
 	EnrichWithConnectionInformationTransport(base, src, 0, dst, 0, syscall.AF_INET, 255)
@@ -262,7 +265,7 @@ func TestEnrichWithProcessInformationNilBase(t *testing.T) {
 }
 
 func TestEnrichWithProcessInformation(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var title [16]byte
 	copy(title[:], "myprocess")
 
@@ -289,7 +292,7 @@ func TestEnrichWithProcessInformation(t *testing.T) {
 }
 
 func TestEnrichWithProcessInformationTitleNullTrimmed(t *testing.T) {
-	base := &ecs.Base{}
+	base := &schema.Base{}
 	var title [16]byte
 	copy(title[:], "cat") // remaining bytes are 0x00
 

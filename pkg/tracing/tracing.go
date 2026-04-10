@@ -6,25 +6,29 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/Motmedel/ecs_go/ecs"
-	motmedelContext "github.com/Motmedel/utils_go/pkg/context"
-	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/ringbuf"
-	tracingErrors "github.com/vphpersson/tracing/pkg/errors"
-	"golang.org/x/sys/unix"
 	"log/slog"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	motmedelContext "github.com/Motmedel/utils_go/pkg/context"
+	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
+	"github.com/Motmedel/utils_go/pkg/errors/types/empty_error"
+	"github.com/Motmedel/utils_go/pkg/errors/types/nil_error"
+	"github.com/Motmedel/utils_go/pkg/schema"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 )
 
 var (
-	cachedBootTime     time.Time
-	cachedBootTimeOnce sync.Once
+	cachedBootTime      time.Time
+	cachedBootTimeErr   error
+	cachedBootTimeOnce  sync.Once
 )
 
 var ianaProtocolNumberToText = map[string]string{
@@ -40,13 +44,16 @@ var ianaProtocolNumberToText = map[string]string{
 	"115": "l2tp",
 }
 
-func GetBootTime() time.Time {
+func GetBootTime() (time.Time, error) {
 	cachedBootTimeOnce.Do(func() {
 		var ts unix.Timespec
-		unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts)
+		if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+			cachedBootTimeErr = fmt.Errorf("clock gettime: %w", err)
+			return
+		}
 		cachedBootTime = time.Now().Add(-time.Duration(ts.Nano()) * time.Nanosecond)
 	})
-	return cachedBootTime
+	return cachedBootTime, cachedBootTimeErr
 }
 
 func ConvertEbpfTimestamp(timestamp uint64, bootTime time.Time) time.Time {
@@ -59,14 +66,20 @@ func ConvertEbpfTimestampToIso8601(timestamp uint64, bootTime time.Time) string 
 
 func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func(*T)) error {
 	if ebpfMap == nil {
-		return tracingErrors.ErrNilEbpfMap
+		return nil_error.New("ebpf map")
 	}
 
 	ringbufReader, err := ringbuf.NewReader(ebpfMap)
 	if err != nil {
 		return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf new reader: %w", err))
 	}
+
+	var closedByContext atomic.Bool
+
 	defer func() {
+		if closedByContext.Load() {
+			return
+		}
 		if err := ringbufReader.Close(); err != nil {
 			slog.WarnContext(
 				motmedelContext.WithError(
@@ -83,6 +96,7 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 
 	go func() {
 		<-ctx.Done()
+		closedByContext.Store(true)
 		ringbufReader.Close()
 	}()
 
@@ -100,7 +114,7 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 			go func() {
 				var event T
 
-				err := binary.Read(bytes.NewBuffer(record.RawSample), binary.BigEndian, &event)
+				err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &event)
 				if err != nil {
 					slog.ErrorContext(
 						motmedelContext.WithError(
@@ -127,7 +141,7 @@ func RunTracingMapReceiver[T any](ctx context.Context, program *ebpf.Program, eb
 	}
 
 	if ebpfMap == nil {
-		return tracingErrors.ErrNilEbpfMap
+		return nil_error.New("ebpf map")
 	}
 
 	tracingLink, err := link.AttachTracing(link.TracingOptions{Program: program})
@@ -169,15 +183,15 @@ func RunTracepointMapReceiver[T any](
 	}
 
 	if group == "" {
-		return tracingErrors.ErrEmptyGroup
+		return empty_error.New("group")
 	}
 
 	if name == "" {
-		return tracingErrors.ErrEmptyName
+		return empty_error.New("name")
 	}
 
 	if ebpfMap == nil {
-		return tracingErrors.ErrNilEbpfMap
+		return nil_error.New("ebpf map")
 	}
 
 	tracepointLink, err := link.Tracepoint(group, name, program, nil)
@@ -217,27 +231,27 @@ func IpAddressFromEbpf(ipAddress [16]byte, addressFamily uint16) string {
 	return ""
 }
 
-func EnrichWithSourceUser(base *ecs.Base, userId uint32) {
+func EnrichWithSourceUser(base *schema.Base, userId uint32) {
 	if base == nil {
 		return
 	}
 
 	ecsSource := base.Source
 	if ecsSource == nil {
-		ecsSource = &ecs.Target{}
+		ecsSource = &schema.Target{}
 		base.Source = ecsSource
 	}
 
 	ecsSourceUser := ecsSource.User
 	if ecsSourceUser == nil {
-		ecsSourceUser = &ecs.User{}
+		ecsSourceUser = &schema.User{}
 		ecsSource.User = ecsSourceUser
 	}
 	ecsSourceUser.Id = strconv.Itoa(int(userId))
 }
 
 func EnrichWithConnectionInformation(
-	base *ecs.Base,
+	base *schema.Base,
 	sourceIp [16]byte,
 	sourcePort uint16,
 	destinationIp [16]byte,
@@ -250,7 +264,7 @@ func EnrichWithConnectionInformation(
 
 	ecsSource := base.Source
 	if ecsSource == nil {
-		ecsSource = &ecs.Target{}
+		ecsSource = &schema.Target{}
 		base.Source = ecsSource
 	}
 	ecsSource.Ip = IpAddressFromEbpf(sourceIp, addressFamily)
@@ -258,7 +272,7 @@ func EnrichWithConnectionInformation(
 
 	ecsDestination := base.Destination
 	if ecsDestination == nil {
-		ecsDestination = &ecs.Target{}
+		ecsDestination = &schema.Target{}
 		base.Destination = ecsDestination
 	}
 	ecsDestination.Ip = IpAddressFromEbpf(destinationIp, addressFamily)
@@ -267,7 +281,7 @@ func EnrichWithConnectionInformation(
 	if addressFamily == syscall.AF_INET || addressFamily == syscall.AF_INET6 {
 		ecsNetwork := base.Network
 		if ecsNetwork == nil {
-			ecsNetwork = &ecs.Network{}
+			ecsNetwork = &schema.Network{}
 			base.Network = ecsNetwork
 		}
 
@@ -281,7 +295,7 @@ func EnrichWithConnectionInformation(
 }
 
 func EnrichWithConnectionInformationTransport(
-	base *ecs.Base,
+	base *schema.Base,
 	sourceIp [16]byte,
 	sourcePort uint16,
 	destinationIp [16]byte,
@@ -301,7 +315,7 @@ func EnrichWithConnectionInformationTransport(
 
 	ecsNetwork := base.Network
 	if ecsNetwork == nil {
-		ecsNetwork = &ecs.Network{}
+		ecsNetwork = &schema.Network{}
 		base.Network = ecsNetwork
 	}
 
@@ -312,7 +326,7 @@ func EnrichWithConnectionInformationTransport(
 }
 
 func EnrichWithProcessInformation(
-	base *ecs.Base,
+	base *schema.Base,
 	processId uint32,
 	processTitle [16]byte,
 	parentProcessId uint32,
@@ -325,7 +339,7 @@ func EnrichWithProcessInformation(
 
 	ecsProcess := base.Process
 	if ecsProcess == nil {
-		ecsProcess = &ecs.Process{}
+		ecsProcess = &schema.Process{}
 		base.Process = ecsProcess
 	}
 
@@ -334,7 +348,7 @@ func EnrichWithProcessInformation(
 
 	ecsProcessUser := ecsProcess.User
 	if ecsProcessUser == nil {
-		ecsProcessUser = &ecs.User{}
+		ecsProcessUser = &schema.User{}
 		ecsProcess.User = ecsProcessUser
 	}
 
@@ -342,7 +356,7 @@ func EnrichWithProcessInformation(
 
 	ecsProcessGroup := ecsProcess.Group
 	if ecsProcessGroup == nil {
-		ecsProcessGroup = &ecs.Group{}
+		ecsProcessGroup = &schema.Group{}
 		ecsProcess.Group = ecsProcessGroup
 	}
 
@@ -350,7 +364,7 @@ func EnrichWithProcessInformation(
 
 	ecsProcessParent := ecsProcess.Parent
 	if ecsProcessParent == nil {
-		ecsProcessParent = &ecs.Process{}
+		ecsProcessParent = &schema.Process{}
 		ecsProcess.Parent = ecsProcessParent
 	}
 
