@@ -1,26 +1,28 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.o
+*
+!/.dockerignore
+!/.gitignore
+!/Dockerfile
+!/Makefile
+!/go.mod
+!/go.sum
+!/tracing.bpf.c
 
-# Test binary, built with `go test -c`
-*.test
+!/cmd/
+!/cmd/tracing_service/
+!/cmd/tracing_service/*.go
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+!/pkg/
+!/pkg/tracing/
+!/pkg/tracing/*.go
+!/pkg/tracing_service/
+!/pkg/tracing_service/*/
+!/pkg/tracing_service/**/*.go
+!/pkg/tracing_service/*.go
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
-go.work
-
-.idea
-*.iml
-
+# The bpf2go output is committed on purpose: building it needs clang plus the
+# kernel headers of whatever host generated it, neither of which belongs in the
+# builder image. CO-RE relocates the object against the target kernel's BTF at
+# load time, so one committed object serves every host. Regenerate with
+# `make bpf` whenever tracing.bpf.c changes.
+!/pkg/tracing_service/packet_logging_bpf_*.go
+!/pkg/tracing_service/packet_logging_bpf_*.o

@@ -5,10 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Motmedel/utils_go/pkg/schema"
+	"github.com/altshiftab/utils_go/pkg/schema"
 )
 
 func TestGetBootTime(t *testing.T) {
+	t.Parallel()
+
 	bootTime, err := GetBootTime()
 	if err != nil {
 		t.Fatalf("GetBootTime returned error: %v", err)
@@ -22,6 +24,8 @@ func TestGetBootTime(t *testing.T) {
 }
 
 func TestGetBootTimeIdempotent(t *testing.T) {
+	t.Parallel()
+
 	a, _ := GetBootTime()
 	b, _ := GetBootTime()
 	if !a.Equal(b) {
@@ -30,6 +34,8 @@ func TestGetBootTimeIdempotent(t *testing.T) {
 }
 
 func TestConvertEbpfTimestamp(t *testing.T) {
+	t.Parallel()
+
 	bootTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	// 1 second in nanoseconds
 	ts := uint64(1_000_000_000)
@@ -41,6 +47,8 @@ func TestConvertEbpfTimestamp(t *testing.T) {
 }
 
 func TestConvertEbpfTimestampToIso8601(t *testing.T) {
+	t.Parallel()
+
 	bootTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 	ts := uint64(500_000_000) // 0.5 seconds
 	result := ConvertEbpfTimestampToIso8601(ts, bootTime)
@@ -51,6 +59,8 @@ func TestConvertEbpfTimestampToIso8601(t *testing.T) {
 }
 
 func TestConvertEbpfTimestampToIso8601Zero(t *testing.T) {
+	t.Parallel()
+
 	bootTime := time.Date(2025, 3, 10, 8, 30, 0, 0, time.UTC)
 	result := ConvertEbpfTimestampToIso8601(0, bootTime)
 	expected := "2025-03-10T08:30:00Z"
@@ -60,6 +70,8 @@ func TestConvertEbpfTimestampToIso8601Zero(t *testing.T) {
 }
 
 func TestIpAddressFromEbpfIPv4(t *testing.T) {
+	t.Parallel()
+
 	var addr [16]byte
 	addr[0] = 192
 	addr[1] = 168
@@ -73,6 +85,8 @@ func TestIpAddressFromEbpfIPv4(t *testing.T) {
 }
 
 func TestIpAddressFromEbpfIPv6(t *testing.T) {
+	t.Parallel()
+
 	var addr [16]byte
 	// ::1 (loopback)
 	addr[15] = 1
@@ -84,6 +98,8 @@ func TestIpAddressFromEbpfIPv6(t *testing.T) {
 }
 
 func TestIpAddressFromEbpfUnknownFamily(t *testing.T) {
+	t.Parallel()
+
 	var addr [16]byte
 	result := IpAddressFromEbpf(addr, 9999)
 	if result != "" {
@@ -92,10 +108,14 @@ func TestIpAddressFromEbpfUnknownFamily(t *testing.T) {
 }
 
 func TestEnrichWithSourceUserNilBase(t *testing.T) {
+	t.Parallel()
+
 	EnrichWithSourceUser(nil, 1000) // should not panic
 }
 
 func TestEnrichWithSourceUser(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	EnrichWithSourceUser(base, 1000)
 
@@ -111,6 +131,8 @@ func TestEnrichWithSourceUser(t *testing.T) {
 }
 
 func TestEnrichWithSourceUserExistingSource(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{Source: &schema.Target{Ip: "10.0.0.1"}}
 	EnrichWithSourceUser(base, 500)
 
@@ -123,11 +145,15 @@ func TestEnrichWithSourceUserExistingSource(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationNilBase(t *testing.T) {
+	t.Parallel()
+
 	var src, dst [16]byte
 	EnrichWithConnectionInformation(nil, src, 80, dst, 443, syscall.AF_INET) // should not panic
 }
 
 func TestEnrichWithConnectionInformationIPv4(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 	src[0], src[1], src[2], src[3] = 10, 0, 0, 1
@@ -162,6 +188,8 @@ func TestEnrichWithConnectionInformationIPv4(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationIPv6(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 	src[15] = 1 // ::1
@@ -181,6 +209,8 @@ func TestEnrichWithConnectionInformationIPv6(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationUnknownFamily(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 	EnrichWithConnectionInformation(base, src, 80, dst, 443, 9999)
@@ -191,11 +221,15 @@ func TestEnrichWithConnectionInformationUnknownFamily(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportNilBase(t *testing.T) {
+	t.Parallel()
+
 	var src, dst [16]byte
 	EnrichWithConnectionInformationTransport(nil, src, 80, dst, 443, syscall.AF_INET, 6) // should not panic
 }
 
 func TestEnrichWithConnectionInformationTransportTCP(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 	src[0], src[1], src[2], src[3] = 10, 0, 0, 1
@@ -218,6 +252,8 @@ func TestEnrichWithConnectionInformationTransportTCP(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportUDP(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 
@@ -229,6 +265,8 @@ func TestEnrichWithConnectionInformationTransportUDP(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportZero(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 
@@ -246,6 +284,8 @@ func TestEnrichWithConnectionInformationTransportZero(t *testing.T) {
 }
 
 func TestEnrichWithConnectionInformationTransportUnknownProtocol(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var src, dst [16]byte
 
@@ -260,11 +300,15 @@ func TestEnrichWithConnectionInformationTransportUnknownProtocol(t *testing.T) {
 }
 
 func TestEnrichWithProcessInformationNilBase(t *testing.T) {
+	t.Parallel()
+
 	var title [16]byte
 	EnrichWithProcessInformation(nil, 1, title, 0, 1000, 1000) // should not panic
 }
 
 func TestEnrichWithProcessInformation(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var title [16]byte
 	copy(title[:], "myprocess")
@@ -292,6 +336,8 @@ func TestEnrichWithProcessInformation(t *testing.T) {
 }
 
 func TestEnrichWithProcessInformationTitleNullTrimmed(t *testing.T) {
+	t.Parallel()
+
 	base := &schema.Base{}
 	var title [16]byte
 	copy(title[:], "cat") // remaining bytes are 0x00

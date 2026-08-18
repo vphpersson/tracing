@@ -14,21 +14,27 @@ import (
 	"syscall"
 	"time"
 
-	motmedelContext "github.com/Motmedel/utils_go/pkg/context"
-	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
-	"github.com/Motmedel/utils_go/pkg/errors/types/empty_error"
-	"github.com/Motmedel/utils_go/pkg/errors/types/nil_error"
-	"github.com/Motmedel/utils_go/pkg/schema"
+	altshiftContext "github.com/altshiftab/utils_go/pkg/context"
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
+	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
+	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
+	"github.com/altshiftab/utils_go/pkg/schema"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 )
 
+// bootTimeResult memoises both halves of the boot time lookup, so the cached
+// error does not have to live in a package-level variable of its own.
+type bootTimeResult struct {
+	bootTime time.Time
+	err      error
+}
+
 var (
-	cachedBootTime      time.Time
-	cachedBootTimeErr   error
-	cachedBootTimeOnce  sync.Once
+	cachedBootTime     bootTimeResult
+	cachedBootTimeOnce sync.Once
 )
 
 var ianaProtocolNumberToText = map[string]string{
@@ -48,16 +54,16 @@ func GetBootTime() (time.Time, error) {
 	cachedBootTimeOnce.Do(func() {
 		var ts unix.Timespec
 		if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
-			cachedBootTimeErr = fmt.Errorf("clock gettime: %w", err)
+			cachedBootTime.err = altshiftErrors.NewWithTrace(fmt.Errorf("clock gettime: %w", err))
 			return
 		}
-		cachedBootTime = time.Now().Add(-time.Duration(ts.Nano()) * time.Nanosecond)
+		cachedBootTime.bootTime = time.Now().Add(-time.Duration(ts.Nano()) * time.Nanosecond)
 	})
-	return cachedBootTime, cachedBootTimeErr
+	return cachedBootTime.bootTime, cachedBootTime.err
 }
 
 func ConvertEbpfTimestamp(timestamp uint64, bootTime time.Time) time.Time {
-	return bootTime.Add(time.Duration(timestamp) * time.Nanosecond)
+	return bootTime.Add(time.Duration(ClampInt64(timestamp)) * time.Nanosecond)
 }
 
 func ConvertEbpfTimestampToIso8601(timestamp uint64, bootTime time.Time) string {
@@ -71,7 +77,7 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 
 	ringbufReader, err := ringbuf.NewReader(ebpfMap)
 	if err != nil {
-		return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf new reader: %w", err))
+		return altshiftErrors.NewWithTrace(fmt.Errorf("ringbuf new reader: %w", err))
 	}
 
 	var closedByContext atomic.Bool
@@ -82,9 +88,9 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 		}
 		if err := ringbufReader.Close(); err != nil {
 			slog.WarnContext(
-				motmedelContext.WithError(
+				altshiftContext.WithError(
 					ctx,
-					motmedelErrors.NewWithTrace(
+					altshiftErrors.NewWithTrace(
 						fmt.Errorf("ringbuf reader close: %w", err),
 						ringbufReader,
 					),
@@ -107,7 +113,7 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 				return nil
 			}
 
-			return motmedelErrors.NewWithTrace(fmt.Errorf("ringbuf read: %w", err), ringbufReader)
+			return altshiftErrors.NewWithTrace(fmt.Errorf("ringbuf read: %w", err), ringbufReader)
 		}
 
 		if callback != nil {
@@ -117,9 +123,9 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 				err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &event)
 				if err != nil {
 					slog.ErrorContext(
-						motmedelContext.WithError(
+						altshiftContext.WithError(
 							ctx,
-							motmedelErrors.NewWithTrace(
+							altshiftErrors.NewWithTrace(
 								fmt.Errorf("binary read: %w", err),
 								record.RawSample,
 							),
@@ -146,14 +152,14 @@ func RunTracingMapReceiver[T any](ctx context.Context, program *ebpf.Program, eb
 
 	tracingLink, err := link.AttachTracing(link.TracingOptions{Program: program})
 	if err != nil {
-		return motmedelErrors.NewWithTrace(fmt.Errorf("link attach tracing: %w", err))
+		return altshiftErrors.NewWithTrace(fmt.Errorf("link attach tracing: %w", err))
 	}
 	defer func() {
 		if err := tracingLink.Close(); err != nil {
 			slog.WarnContext(
-				motmedelContext.WithError(
+				altshiftContext.WithError(
 					ctx,
-					motmedelErrors.NewWithTrace(
+					altshiftErrors.NewWithTrace(
 						fmt.Errorf("tracing link close: %w", err),
 						tracingLink,
 					),
@@ -196,14 +202,14 @@ func RunTracepointMapReceiver[T any](
 
 	tracepointLink, err := link.Tracepoint(group, name, program, nil)
 	if err != nil {
-		return motmedelErrors.NewWithTrace(fmt.Errorf("link tracepoint: %w", err))
+		return altshiftErrors.NewWithTrace(fmt.Errorf("link tracepoint: %w", err))
 	}
 	defer func() {
 		if err := tracepointLink.Close(); err != nil {
 			slog.WarnContext(
-				motmedelContext.WithError(
+				altshiftContext.WithError(
 					ctx,
-					motmedelErrors.NewWithTrace(
+					altshiftErrors.NewWithTrace(
 						fmt.Errorf("tracepoint link close: %w", err),
 						tracepointLink,
 					),

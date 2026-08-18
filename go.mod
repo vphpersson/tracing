@@ -1,11 +1,10 @@
 module github.com/vphpersson/tracing
 
-go 1.25
+go 1.26.0
 
 require (
-	github.com/Motmedel/utils_go v0.0.461
-	github.com/cilium/ebpf v0.18.0
-	golang.org/x/sys v0.33.0
+	github.com/altshiftab/utils_go v1.23.2
+	github.com/cilium/ebpf v0.22.0
+	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 )
-
-require golang.org/x/net v0.40.0 // indirect
