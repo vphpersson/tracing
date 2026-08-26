@@ -1,7 +1,6 @@
 BINARY   := tracing_service
 IMAGE    := tracing
 REGISTRY := registry.home.arpa
-GO_ENV   := GOEXPERIMENT=jsonv2
 
 KERNEL_VERSION := $(shell uname -r)
 BPF_INCLUDES := -I/usr/lib/modules/$(KERNEL_VERSION)/build/include \
@@ -24,16 +23,16 @@ bpf:
 	sed --in-place --regexp-extended -e 's/loadBpf\(/LoadBpf(/g' -e 's/loadBpfObjects\(/LoadBpfObjects(/g' -e 's/(bpf(Objects|Programs|Maps|Specs|ProgramSpecs|MapSpecs|Variables|VariableSpecs))\b/Bpf\2/g' -e 's/^(type|func) ([a-z])/\1 \U\2\E/g' ${OUTPUT_DIR}/${OUTPUT_STEM}_${TARGET}.go
 
 build:
-	$(GO_ENV) CGO_ENABLED=0 go build -ldflags="-s -w" -o $(BINARY) ./cmd/tracing_service
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o $(BINARY) ./cmd/tracing_service
 
 test:
-	$(GO_ENV) go test ./...
+	go test ./...
 
 fmt:
 	gofmt -w .
 
 vet:
-	$(GO_ENV) go vet ./...
+	go vet ./...
 
 image:
 	podman build -t $(IMAGE) .
