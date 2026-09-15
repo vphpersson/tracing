@@ -23,13 +23,49 @@ func TestGetBootTime(t *testing.T) {
 	}
 }
 
-func TestGetBootTimeIdempotent(t *testing.T) {
+// Successive calls resolve the same fixed instant, but from two separate pairs of clock reads,
+// so they agree within read jitter rather than exactly.
+func TestGetBootTimeStable(t *testing.T) {
 	t.Parallel()
 
-	a, _ := GetBootTime()
-	b, _ := GetBootTime()
-	if !a.Equal(b) {
-		t.Fatalf("GetBootTime returned different values: %v vs %v", a, b)
+	const tolerance = 50 * time.Millisecond
+
+	first, err := GetBootTime()
+	if err != nil {
+		t.Fatalf("GetBootTime returned error: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	second, err := GetBootTime()
+	if err != nil {
+		t.Fatalf("GetBootTime returned error: %v", err)
+	}
+
+	if delta := second.Sub(first); delta > tolerance || delta < -tolerance {
+		t.Fatalf("GetBootTime moved by %v between calls, tolerance %v", delta, tolerance)
+	}
+}
+
+// GetBootTime must re-read the clock on every call. A memoised anchor silently absorbs any
+// wall-clock step taken after the first call (an NTP correction on a host that booted with a bad
+// clock) and skews every event by that step for the life of the process.
+func TestGetBootTimeNotMemoised(t *testing.T) {
+	t.Parallel()
+
+	const calls = 2000
+
+	seen := make(map[int64]struct{}, calls)
+	for range calls {
+		bootTime, err := GetBootTime()
+		if err != nil {
+			t.Fatalf("GetBootTime returned error: %v", err)
+		}
+		seen[bootTime.UnixNano()] = struct{}{}
+	}
+
+	if len(seen) == 1 {
+		t.Fatalf("GetBootTime returned one identical value across %d calls; the clock is not being re-read", calls)
 	}
 }
 

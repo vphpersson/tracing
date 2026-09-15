@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -25,18 +24,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// bootTimeResult memoises both halves of the boot time lookup, so the cached
-// error does not have to live in a package-level variable of its own.
-type bootTimeResult struct {
-	bootTime time.Time
-	err      error
-}
-
-var (
-	cachedBootTime     bootTimeResult
-	cachedBootTimeOnce sync.Once
-)
-
 var ianaProtocolNumberToText = map[string]string{
 	"1":   "icmp",
 	"2":   "igmp",
@@ -50,16 +37,16 @@ var ianaProtocolNumberToText = map[string]string{
 	"115": "l2tp",
 }
 
+// GetBootTime is deliberately not memoised: the wall clock can be stepped after start (NTP
+// correction on a host that booted with a bad clock), which would leave a cached anchor skewed
+// by the step for the life of the process.
 func GetBootTime() (time.Time, error) {
-	cachedBootTimeOnce.Do(func() {
-		var ts unix.Timespec
-		if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
-			cachedBootTime.err = altshiftErrors.NewWithTrace(fmt.Errorf("clock gettime: %w", err))
-			return
-		}
-		cachedBootTime.bootTime = time.Now().Add(-time.Duration(ts.Nano()) * time.Nanosecond)
-	})
-	return cachedBootTime.bootTime, cachedBootTime.err
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		return time.Time{}, altshiftErrors.NewWithTrace(fmt.Errorf("clock gettime: %w", err))
+	}
+
+	return time.Now().Add(-time.Duration(ts.Nano()) * time.Nanosecond), nil
 }
 
 func ConvertEbpfTimestamp(timestamp uint64, bootTime time.Time) time.Time {
