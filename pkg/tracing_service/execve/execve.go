@@ -20,6 +20,9 @@ import (
 	"time"
 )
 
+// execveatVariant marks an event of an execveat call, which runs a file by descriptor as well as by path.
+const execveatVariant = 1
+
 func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEvent) error {
 	if base == nil {
 		return nil
@@ -47,7 +50,12 @@ func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEv
 
 	executable := string(bytes.TrimRight(event.Filename[:], "\x00"))
 
-	argvStrings := []string{executable}
+	// An exec by descriptor alone that failed has no path; its argv[0] is all there is of what was run.
+	first := executable
+	if first == "" && event.Argc > 0 {
+		first = string(bytes.TrimRight(event.Argv[0][:], "\x00"))
+	}
+	argvStrings := []string{first}
 	for i := uint32(1); i < event.Argc && int(i) < len(event.Argv); i++ {
 		argString := string(bytes.TrimRight(event.Argv[i][:], "\x00"))
 		if argString != "" {
@@ -70,8 +78,15 @@ func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEv
 	ecsProcess.ArgsCount = len(argvStrings)
 	ecsProcess.CommandLine = altshiftStrings.ShellJoin(argvStrings)
 	ecsProcess.Executable = executable
-	ecsProcess.Name = filepath.Base(executable)
+	if executable != "" {
+		ecsProcess.Name = filepath.Base(executable)
+	}
 	ecsProcess.Thread = &schema.ProcessThread{Id: int(event.ThreadId)}
+
+	if event.SyscallVariant == execveatVariant && base.Event != nil {
+		base.Event.Action = "execveat"
+		base.Event.Reason = "An execveat call was made."
+	}
 
 	ecsProcessParent := ecsProcess.Parent
 	if ecsProcessParent == nil {
@@ -114,13 +129,14 @@ func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEv
 	return nil
 }
 
-// Run reports execve calls with what they returned. enterProgram reads the arguments on entry and exitProgram
-// submits the event on exit; the failed attempts of a PATH search are folded into the exec that worked (see
-// collapser), so a failure is reported up to lookupWindow after it happened. dropsMap counts the events the eBPF side
-// lost, which are logged.
+// Run reports execve and execveat calls with what they returned. enterProgram and enterAtProgram read the arguments
+// on entry and exitProgram submits the event on exit; the failed attempts of a PATH search are folded into the exec
+// that worked (see collapser), so a failure is reported up to lookupWindow after it happened. dropsMap counts the
+// events the eBPF side lost, which are logged.
 func Run(
 	ctx context.Context,
 	enterProgram *ebpf.Program,
+	enterAtProgram *ebpf.Program,
 	exitProgram *ebpf.Program,
 	ebpfMap *ebpf.Map,
 	dropsMap *ebpf.Map,
@@ -128,6 +144,11 @@ func Run(
 	return func(yield func(*tracing_service.EventResult, error) bool) {
 		if enterProgram == nil {
 			yield(nil, altshiftErrors.NewWithTrace(nil_error.New("enter program")))
+			return
+		}
+
+		if enterAtProgram == nil {
+			yield(nil, altshiftErrors.NewWithTrace(nil_error.New("enter at program")))
 			return
 		}
 
@@ -141,19 +162,30 @@ func Run(
 			return
 		}
 
-		exitLink, err := link.Tracepoint("syscalls", "sys_exit_execve", exitProgram, nil)
-		if err != nil {
-			yield(nil, altshiftErrors.NewWithTrace(fmt.Errorf("link tracepoint: %w", err)))
-			return
-		}
-		defer func() {
-			if err := exitLink.Close(); err != nil {
-				slog.WarnContext(
-					altshiftContext.WithError(ctx, altshiftErrors.NewWithTrace(fmt.Errorf("tracepoint link close: %w", err), exitLink)),
-					"An error occurred when closing a tracepoint link.",
-				)
+		// The enter of execve is attached by the receiver below. A successful execveat exits through
+		// sys_exit_execve, a failed one through sys_exit_execveat, so the exit program goes on both.
+		for _, tracepoint := range []struct {
+			name    string
+			program *ebpf.Program
+		}{
+			{name: "sys_enter_execveat", program: enterAtProgram},
+			{name: "sys_exit_execve", program: exitProgram},
+			{name: "sys_exit_execveat", program: exitProgram},
+		} {
+			tracepointLink, err := link.Tracepoint("syscalls", tracepoint.name, tracepoint.program, nil)
+			if err != nil {
+				yield(nil, altshiftErrors.NewWithTrace(fmt.Errorf("link tracepoint: %w", err), tracepoint.name))
+				return
 			}
-		}()
+			defer func() {
+				if err := tracepointLink.Close(); err != nil {
+					slog.WarnContext(
+						altshiftContext.WithError(ctx, altshiftErrors.NewWithTrace(fmt.Errorf("tracepoint link close: %w", err), tracepoint.name)),
+						"An error occurred when closing a tracepoint link.",
+					)
+				}
+			}()
+		}
 
 		var mu sync.Mutex
 		receiverCtx, cancelReceiver := context.WithCancel(ctx)
@@ -203,7 +235,7 @@ func Run(
 		}
 
 		// In order: the collapser relies on a process's attempts arriving as it made them.
-		err = tracing.RunTracepointOrderedMapReceiver(
+		err := tracing.RunTracepointOrderedMapReceiver(
 			receiverCtx,
 			enterProgram,
 			"syscalls",
@@ -275,11 +307,12 @@ func Run(
 // dropCounter reports the execve events the eBPF side counted as lost, by where they were lost.
 type dropCounter struct {
 	ebpfMap  *ebpf.Map
-	reported [3]uint64
+	reported [len(dropPlaces)]uint64
 }
 
-// The places the eBPF side counts a lost execve event, by index in the execve_drops map.
-var dropPlaces = [3]string{"stage", "evicted", "ringbuf"}
+// The places the eBPF side counts a lost execve event, by index in the execve_drops map. unstaged_failure is a failed
+// call with no staged entry, as one refused before the entry tracepoint has (a seccomp filter returning an errno).
+var dropPlaces = [4]string{"stage", "evicted", "ringbuf", "unstaged_failure"}
 
 func newDropCounter(ebpfMap *ebpf.Map) *dropCounter {
 	return &dropCounter{ebpfMap: ebpfMap}

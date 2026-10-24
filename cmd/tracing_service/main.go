@@ -172,6 +172,7 @@ func main() {
 		execveTracing.Run(
 			errGroupCtx,
 			objs.EnterExecve,
+			objs.EnterExecveat,
 			objs.ExitExecve,
 			objs.ExecveEvents,
 			objs.ExecveDrops,

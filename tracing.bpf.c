@@ -48,6 +48,8 @@ struct execve_event {
     u32 parent_process_id;
     // The calling thread: a process's lookups are only one lookup per thread.
     u32 thread_id;
+    // 0 for execve, 1 for execveat.
+    u32 syscall_variant;
     u8 process_title[TASK_COMM_LEN];
 
 	u8  filename[ARGSIZE];
@@ -72,6 +74,7 @@ static struct execve_event zero_execve_event SEC(".rodata") = {
     .process_id = 0,
     .parent_process_id = 0,
     .thread_id = 0,
+    .syscall_variant = 0,
     .process_title = {0},
 
     .filename = {0},
@@ -87,27 +90,33 @@ static struct execve_event zero_execve_event SEC(".rodata") = {
 // only be read on entry and the result only on exit, so the event waits here.
 // The task is the same at both ends even when a non-leader thread's exec takes
 // over the leader's process ID. LRU so an entry whose exit was never seen is
-// evicted rather than kept; an LRU map keeps part of its entries reserved per
-// CPU, so it is sized well above the execs expected in flight at once (each
-// entry is ~34 KB, preallocated).
+// evicted rather than kept. The lists are per CPU: with one common list, a CPU
+// that ran out of free entries evicted live ones staged on other CPUs before
+// taking their free entries, losing execs in flight. Per CPU, an entry only
+// competes with the execs staged on its own CPU (1024 / CPUs of them). Each
+// entry is ~34 KB, preallocated.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, u64);
     __type(value, struct execve_event);
     __uint(max_entries, 1024);
+    __uint(map_flags, BPF_F_NO_COMMON_LRU);
 } pending_execve_events SEC(".maps");
 
-// execve events lost, per CPU, by where: the call could not be staged, its
-// staged entry was gone by its exit, or the ring buffer was full.
+// execve events lost, per CPU, by where: the call could not be staged; an exec
+// that worked had no staged entry by its exit (evicted); the ring buffer was
+// full; or a failed call had no staged entry, which is what a call refused
+// before the entry tracepoint looks like (a seccomp filter returning an errno).
 #define EXECVE_DROP_STAGE 0
 #define EXECVE_DROP_EVICTED 1
 #define EXECVE_DROP_RINGBUF 2
+#define EXECVE_DROP_UNSTAGED_FAILURE 3
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
     __type(value, u64);
-    __uint(max_entries, 3);
+    __uint(max_entries, 4);
 } execve_drops SEC(".maps");
 
 static __always_inline void count_execve_drop(u32 where) {
@@ -130,6 +139,23 @@ struct exec_info {
 	const u8 *const *envp;
 };
 
+// The arguments of execveat, as its entry tracepoint reports them (each one 8
+// bytes wide).
+struct exec_at_info {
+	u16 common_type;
+	u8 common_flags;
+	u8 common_preempt_count;
+	s32 common_pid;
+
+	s32 syscall_nr;
+	u32 pad;
+	s64 fd;
+	const u8 *filename;
+	const u8 *const *argv;
+	const u8 *const *envp;
+	s64 flags;
+};
+
 struct exec_exit_info {
 	u16 common_type;
 	u8 common_flags;
@@ -141,8 +167,8 @@ struct exec_exit_info {
 	s64 ret;
 };
 
-SEC("tracepoint/syscalls/sys_enter_execve")
-s32 enter_execve(struct exec_info *execve_ctx) {
+// stage_exec keeps the event of an execve or execveat call until its exit.
+static __always_inline s32 stage_exec(const u8 *filename, const u8 *const *argv, u32 syscall_variant) {
     u64 timestamp_ns = bpf_ktime_get_boot_ns();
 
     u64 task_key = (u64) bpf_get_current_task();
@@ -160,6 +186,7 @@ s32 enter_execve(struct exec_info *execve_ctx) {
     s32 ret = 0;
 
     event->timestamp_ns = timestamp_ns;
+    event->syscall_variant = syscall_variant;
 
     u64 uid_gid = bpf_get_current_uid_gid();
     event->user_id = (u32) uid_gid;
@@ -190,7 +217,7 @@ s32 enter_execve(struct exec_info *execve_ctx) {
 
     // Write the filename in addition to argv[0] because the filename contains the full path to the file which could
     // be more useful in some situations.
-    ret = bpf_probe_read_user_str(&event->filename, sizeof(event->filename), execve_ctx->filename);
+    ret = bpf_probe_read_user_str(&event->filename, sizeof(event->filename), filename);
     if (ret < 0) {
         bpf_map_delete_elem(&pending_execve_events, &task_key);
         count_execve_drop(EXECVE_DROP_STAGE);
@@ -198,12 +225,12 @@ s32 enter_execve(struct exec_info *execve_ctx) {
     }
 
     for (u32 i = 0; i < ARGLEN; i++) {
-        if (!(&execve_ctx->argv[i])) {
+        if (!(&argv[i])) {
             goto done;
         }
 
         const u8 *argp = NULL;
-        ret = bpf_probe_read_user(&argp, sizeof(argp), &execve_ctx->argv[i]);
+        ret = bpf_probe_read_user(&argp, sizeof(argp), &argv[i]);
         if (ret || !argp) {
             goto done;
         }
@@ -225,19 +252,40 @@ done:
     return 0;
 }
 
+SEC("tracepoint/syscalls/sys_enter_execve")
+s32 enter_execve(struct exec_info *execve_ctx) {
+    return stage_exec(execve_ctx->filename, execve_ctx->argv, 0);
+}
+
+// execveat runs a file by descriptor as well as by path: fexecve, and with it
+// the runtimes that re-execute themselves from a sealed memfd (crun, runc) and
+// programs run without ever being written to disk.
+SEC("tracepoint/syscalls/sys_enter_execveat")
+s32 enter_execveat(struct exec_at_info *execveat_ctx) {
+    return stage_exec(execveat_ctx->filename, execveat_ctx->argv, 1);
+}
+
 // The event of the call, now with its result. After a successful exec this runs
-// in the new program, in the same task.
+// in the new program, in the same task. It is attached to the exit of both
+// calls, and a successful execveat exits through sys_exit_execve. An exec by
+// descriptor alone (AT_EMPTY_PATH) has no path, so the one of what it ran is
+// filled in from the new image.
 SEC("tracepoint/syscalls/sys_exit_execve")
 s32 exit_execve(struct exec_exit_info *exit_ctx) {
     u64 task_key = (u64) bpf_get_current_task();
 
     struct execve_event *event = bpf_map_lookup_elem(&pending_execve_events, &task_key);
     if (!event) {
-        count_execve_drop(EXECVE_DROP_EVICTED);
+        count_execve_drop(exit_ctx->ret == 0 ? EXECVE_DROP_EVICTED : EXECVE_DROP_UNSTAGED_FAILURE);
         return 0;
     }
 
     event->return_value = exit_ctx->ret;
+    if (exit_ctx->ret == 0 && event->filename[0] == 0) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        const u8 *exe = BPF_CORE_READ(task, mm, exe_file, f_path.dentry, d_name.name);
+        bpf_probe_read_kernel_str(&event->filename, sizeof(event->filename), exe);
+    }
     if (bpf_ringbuf_output(&execve_events, event, sizeof(*event), 0)) {
         count_execve_drop(EXECVE_DROP_RINGBUF);
     }

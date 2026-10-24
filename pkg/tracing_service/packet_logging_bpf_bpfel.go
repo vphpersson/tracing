@@ -95,10 +95,12 @@ type BpfExecveEvent struct {
 	ProcessId            uint32
 	ParentProcessId      uint32
 	ThreadId             uint32
+	SyscallVariant       uint32
 	ProcessTitle         [16]uint8
 	Filename             [1024]uint8
 	Argv                 [32][1024]uint8
 	Argc                 uint32
+	_                    [4]byte
 	ReturnValue          int64
 	ParentExecutableName [256]uint8
 	ParentCommandLine    [256]uint8
@@ -235,6 +237,7 @@ const (
 	bpfMapTcpRetransmissionSynackEvents = "tcp_retransmission_synack_events"
 	bpfMapTcpSetStateEvents             = "tcp_set_state_events"
 	bpfProgEnterExecve                  = "enter_execve"
+	bpfProgEnterExecveat                = "enter_execveat"
 	bpfProgExitExecve                   = "exit_execve"
 	bpfProgNfCtHelperDestroy            = "nf_ct_helper_destroy"
 	bpfProgTcpConnect                   = "tcp_connect"
@@ -305,6 +308,7 @@ type BpfSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type BpfProgramSpecs struct {
 	EnterExecve           *ebpf.ProgramSpec `ebpf:"enter_execve"`
+	EnterExecveat         *ebpf.ProgramSpec `ebpf:"enter_execveat"`
 	ExitExecve            *ebpf.ProgramSpec `ebpf:"exit_execve"`
 	NfCtHelperDestroy     *ebpf.ProgramSpec `ebpf:"nf_ct_helper_destroy"`
 	TcpConnect            *ebpf.ProgramSpec `ebpf:"tcp_connect"`
@@ -442,6 +446,7 @@ type BpfVariables struct {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type BpfPrograms struct {
 	EnterExecve           *ebpf.Program `ebpf:"enter_execve"`
+	EnterExecveat         *ebpf.Program `ebpf:"enter_execveat"`
 	ExitExecve            *ebpf.Program `ebpf:"exit_execve"`
 	NfCtHelperDestroy     *ebpf.Program `ebpf:"nf_ct_helper_destroy"`
 	TcpConnect            *ebpf.Program `ebpf:"tcp_connect"`
@@ -460,6 +465,7 @@ type BpfPrograms struct {
 func (p *BpfPrograms) Close() error {
 	return _BpfClose(
 		p.EnterExecve,
+		p.EnterExecveat,
 		p.ExitExecve,
 		p.NfCtHelperDestroy,
 		p.TcpConnect,

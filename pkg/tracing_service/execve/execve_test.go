@@ -130,3 +130,66 @@ func TestEnrichWithExecveEvent(t *testing.T) {
 		})
 	}
 }
+
+func TestEnrichExecveVariants(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name           string
+		variant        uint32
+		threadId       uint32
+		expectedAction string
+		expectedReason string
+	}{
+		{name: "execve", variant: 0, threadId: 7, expectedAction: "execve", expectedReason: "An execve call was made."},
+		{name: "execveat", variant: execveatVariant, threadId: 8, expectedAction: "execveat", expectedReason: "An execveat call was made."},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			event := &tracing_service.BpfExecveEvent{
+				TimestampNs:    1_000_000_000,
+				ProcessId:      7,
+				ThreadId:       testCase.threadId,
+				SyscallVariant: testCase.variant,
+				Filename:       filenameBytes("/usr/bin/crun"),
+				Argc:           1,
+			}
+			base := &schema.Base{Event: &schema.Event{Action: "execve", Reason: "An execve call was made."}}
+			if err := EnrichWithExecveEvent(base, event); err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+
+			if base.Event.Action != testCase.expectedAction {
+				t.Errorf("action %q, want %q", base.Event.Action, testCase.expectedAction)
+			}
+			if base.Event.Reason != testCase.expectedReason {
+				t.Errorf("reason %q, want %q", base.Event.Reason, testCase.expectedReason)
+			}
+			if base.Process.Thread == nil || base.Process.Thread.Id != int(testCase.threadId) {
+				t.Errorf("thread %+v, want id %d", base.Process.Thread, testCase.threadId)
+			}
+		})
+	}
+}
+
+func TestEnrichExecByDescriptorWithoutPath(t *testing.T) {
+	t.Parallel()
+
+	event := &tracing_service.BpfExecveEvent{TimestampNs: 1_000_000_000, ProcessId: 9, Argc: 2}
+	copy(event.Argv[0][:], "hostname-file")
+	copy(event.Argv[1][:], "-x")
+
+	base := &schema.Base{}
+	if err := EnrichWithExecveEvent(base, event); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if base.Process.Executable != "" || base.Process.Name != "" {
+		t.Errorf("executable %q, name %q, want both empty", base.Process.Executable, base.Process.Name)
+	}
+	if want := "hostname-file -x"; base.Process.CommandLine != want {
+		t.Errorf("command line %q, want %q", base.Process.CommandLine, want)
+	}
+}
