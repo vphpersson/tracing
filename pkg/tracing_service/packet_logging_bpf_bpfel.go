@@ -94,13 +94,14 @@ type BpfExecveEvent struct {
 	GroupId              uint32
 	ProcessId            uint32
 	ParentProcessId      uint32
+	ThreadId             uint32
 	ProcessTitle         [16]uint8
 	Filename             [1024]uint8
 	Argv                 [32][1024]uint8
 	Argc                 uint32
+	ReturnValue          int64
 	ParentExecutableName [256]uint8
 	ParentCommandLine    [256]uint8
-	_                    [4]byte
 }
 
 type BpfFileOpenEvent struct {
@@ -221,10 +222,12 @@ const (
 	bpfMapConnectLatencyEvents          = "connect_latency_events"
 	bpfMapConnectStartInfos             = "connect_start_infos"
 	bpfMapDestroyConnectionEvents       = "destroy_connection_events"
+	bpfMapExecveDrops                   = "execve_drops"
 	bpfMapExecveEvents                  = "execve_events"
 	bpfMapFileOpenEvents                = "file_open_events"
 	bpfMapPacketDropEvents              = "packet_drop_events"
 	bpfMapPacketDropReasonFilter        = "packet_drop_reason_filter"
+	bpfMapPendingExecveEvents           = "pending_execve_events"
 	bpfMapTcpErrorEvents                = "tcp_error_events"
 	bpfMapTcpIcmpErrorEvents            = "tcp_icmp_error_events"
 	bpfMapTcpResetEvents                = "tcp_reset_events"
@@ -232,6 +235,7 @@ const (
 	bpfMapTcpRetransmissionSynackEvents = "tcp_retransmission_synack_events"
 	bpfMapTcpSetStateEvents             = "tcp_set_state_events"
 	bpfProgEnterExecve                  = "enter_execve"
+	bpfProgExitExecve                   = "exit_execve"
 	bpfProgNfCtHelperDestroy            = "nf_ct_helper_destroy"
 	bpfProgTcpConnect                   = "tcp_connect"
 	bpfProgTcpDoneWithError             = "tcp_done_with_error"
@@ -301,6 +305,7 @@ type BpfSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type BpfProgramSpecs struct {
 	EnterExecve           *ebpf.ProgramSpec `ebpf:"enter_execve"`
+	ExitExecve            *ebpf.ProgramSpec `ebpf:"exit_execve"`
 	NfCtHelperDestroy     *ebpf.ProgramSpec `ebpf:"nf_ct_helper_destroy"`
 	TcpConnect            *ebpf.ProgramSpec `ebpf:"tcp_connect"`
 	TcpDoneWithError      *ebpf.ProgramSpec `ebpf:"tcp_done_with_error"`
@@ -323,10 +328,12 @@ type BpfMapSpecs struct {
 	ConnectLatencyEvents          *ebpf.MapSpec `ebpf:"connect_latency_events"`
 	ConnectStartInfos             *ebpf.MapSpec `ebpf:"connect_start_infos"`
 	DestroyConnectionEvents       *ebpf.MapSpec `ebpf:"destroy_connection_events"`
+	ExecveDrops                   *ebpf.MapSpec `ebpf:"execve_drops"`
 	ExecveEvents                  *ebpf.MapSpec `ebpf:"execve_events"`
 	FileOpenEvents                *ebpf.MapSpec `ebpf:"file_open_events"`
 	PacketDropEvents              *ebpf.MapSpec `ebpf:"packet_drop_events"`
 	PacketDropReasonFilter        *ebpf.MapSpec `ebpf:"packet_drop_reason_filter"`
+	PendingExecveEvents           *ebpf.MapSpec `ebpf:"pending_execve_events"`
 	TcpErrorEvents                *ebpf.MapSpec `ebpf:"tcp_error_events"`
 	TcpIcmpErrorEvents            *ebpf.MapSpec `ebpf:"tcp_icmp_error_events"`
 	TcpResetEvents                *ebpf.MapSpec `ebpf:"tcp_reset_events"`
@@ -377,10 +384,12 @@ type BpfMaps struct {
 	ConnectLatencyEvents          *ebpf.Map `ebpf:"connect_latency_events"`
 	ConnectStartInfos             *ebpf.Map `ebpf:"connect_start_infos"`
 	DestroyConnectionEvents       *ebpf.Map `ebpf:"destroy_connection_events"`
+	ExecveDrops                   *ebpf.Map `ebpf:"execve_drops"`
 	ExecveEvents                  *ebpf.Map `ebpf:"execve_events"`
 	FileOpenEvents                *ebpf.Map `ebpf:"file_open_events"`
 	PacketDropEvents              *ebpf.Map `ebpf:"packet_drop_events"`
 	PacketDropReasonFilter        *ebpf.Map `ebpf:"packet_drop_reason_filter"`
+	PendingExecveEvents           *ebpf.Map `ebpf:"pending_execve_events"`
 	TcpErrorEvents                *ebpf.Map `ebpf:"tcp_error_events"`
 	TcpIcmpErrorEvents            *ebpf.Map `ebpf:"tcp_icmp_error_events"`
 	TcpResetEvents                *ebpf.Map `ebpf:"tcp_reset_events"`
@@ -395,10 +404,12 @@ func (m *BpfMaps) Close() error {
 		m.ConnectLatencyEvents,
 		m.ConnectStartInfos,
 		m.DestroyConnectionEvents,
+		m.ExecveDrops,
 		m.ExecveEvents,
 		m.FileOpenEvents,
 		m.PacketDropEvents,
 		m.PacketDropReasonFilter,
+		m.PendingExecveEvents,
 		m.TcpErrorEvents,
 		m.TcpIcmpErrorEvents,
 		m.TcpResetEvents,
@@ -431,6 +442,7 @@ type BpfVariables struct {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type BpfPrograms struct {
 	EnterExecve           *ebpf.Program `ebpf:"enter_execve"`
+	ExitExecve            *ebpf.Program `ebpf:"exit_execve"`
 	NfCtHelperDestroy     *ebpf.Program `ebpf:"nf_ct_helper_destroy"`
 	TcpConnect            *ebpf.Program `ebpf:"tcp_connect"`
 	TcpDoneWithError      *ebpf.Program `ebpf:"tcp_done_with_error"`
@@ -448,6 +460,7 @@ type BpfPrograms struct {
 func (p *BpfPrograms) Close() error {
 	return _BpfClose(
 		p.EnterExecve,
+		p.ExitExecve,
 		p.NfCtHelperDestroy,
 		p.TcpConnect,
 		p.TcpDoneWithError,

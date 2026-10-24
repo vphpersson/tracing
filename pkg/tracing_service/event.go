@@ -21,6 +21,9 @@ func BaseToSlogAttrs(base *schema.Base) []slog.Attr {
 	if base.Event != nil {
 		attrs = append(attrs, slog.Any("event", base.Event))
 	}
+	if base.Error != nil {
+		attrs = append(attrs, slog.Any("error", base.Error))
+	}
 	if base.Source != nil {
 		attrs = append(attrs, slog.Any("source", base.Source))
 	}

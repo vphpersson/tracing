@@ -57,7 +57,17 @@ func ConvertEbpfTimestampToIso8601(timestamp uint64, bootTime time.Time) string 
 	return ConvertEbpfTimestamp(timestamp, bootTime).UTC().Format("2006-01-02T15:04:05.999999999Z")
 }
 
+// RunMapReceiver decodes each record of a ring buffer concurrently and runs callback on it, in no particular order.
 func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func(*T)) error {
+	return runMapReceiver(ctx, ebpfMap, callback, false)
+}
+
+// RunOrderedMapReceiver is RunMapReceiver with the callbacks run one at a time, in the order the records were read.
+func RunOrderedMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func(*T)) error {
+	return runMapReceiver(ctx, ebpfMap, callback, true)
+}
+
+func runMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func(*T), ordered bool) error {
 	if ebpfMap == nil {
 		return nil_error.New("ebpf map")
 	}
@@ -93,7 +103,12 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 		ringbufReader.Close()
 	}()
 
-	for {
+	var delivery *orderedDelivery[T]
+	if ordered {
+		delivery = newOrderedDelivery(callback)
+	}
+
+	for seq := uint64(0); ; seq++ {
 		record, err := ringbufReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
@@ -119,9 +134,16 @@ func RunMapReceiver[T any](ctx context.Context, ebpfMap *ebpf.Map, callback func
 						),
 						"An error occurred when parsing a record.",
 					)
+					if delivery != nil {
+						delivery.deliver(seq, nil)
+					}
 					return
 				}
 
+				if delivery != nil {
+					delivery.deliver(seq, &event)
+					return
+				}
 				callback(&event)
 			}()
 		}
@@ -171,6 +193,31 @@ func RunTracepointMapReceiver[T any](
 	ebpfMap *ebpf.Map,
 	callback func(*T),
 ) error {
+	return runTracepointMapReceiver(ctx, program, group, name, ebpfMap, callback, false)
+}
+
+// RunTracepointOrderedMapReceiver is RunTracepointMapReceiver with the callbacks run in the order the records were
+// read (see RunOrderedMapReceiver).
+func RunTracepointOrderedMapReceiver[T any](
+	ctx context.Context,
+	program *ebpf.Program,
+	group string,
+	name string,
+	ebpfMap *ebpf.Map,
+	callback func(*T),
+) error {
+	return runTracepointMapReceiver(ctx, program, group, name, ebpfMap, callback, true)
+}
+
+func runTracepointMapReceiver[T any](
+	ctx context.Context,
+	program *ebpf.Program,
+	group string,
+	name string,
+	ebpfMap *ebpf.Map,
+	callback func(*T),
+	ordered bool,
+) error {
 	if program == nil {
 		return nil
 	}
@@ -206,7 +253,7 @@ func RunTracepointMapReceiver[T any](
 		}
 	}()
 
-	if err = RunMapReceiver(ctx, ebpfMap, callback); err != nil {
+	if err = runMapReceiver(ctx, ebpfMap, callback, ordered); err != nil {
 		return fmt.Errorf("run map receiver: %w", err)
 	}
 

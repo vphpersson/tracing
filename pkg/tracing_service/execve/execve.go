@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	altshiftContext "github.com/altshiftab/utils_go/pkg/context"
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
 	"github.com/altshiftab/utils_go/pkg/schema"
 	altshiftStrings "github.com/altshiftab/utils_go/pkg/strings"
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/vphpersson/tracing/pkg/tracing"
 	"github.com/vphpersson/tracing/pkg/tracing_service"
 	"iter"
+	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEvent) error {
@@ -67,6 +71,7 @@ func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEv
 	ecsProcess.CommandLine = altshiftStrings.ShellJoin(argvStrings)
 	ecsProcess.Executable = executable
 	ecsProcess.Name = filepath.Base(executable)
+	ecsProcess.Thread = &schema.ProcessThread{Id: int(event.ThreadId)}
 
 	ecsProcessParent := ecsProcess.Parent
 	if ecsProcessParent == nil {
@@ -109,10 +114,25 @@ func EnrichWithExecveEvent(base *schema.Base, event *tracing_service.BpfExecveEv
 	return nil
 }
 
-func Run(ctx context.Context, program *ebpf.Program, ebpfMap *ebpf.Map) iter.Seq2[*tracing_service.EventResult, error] {
+// Run reports execve calls with what they returned. enterProgram reads the arguments on entry and exitProgram
+// submits the event on exit; the failed attempts of a PATH search are folded into the exec that worked (see
+// collapser), so a failure is reported up to lookupWindow after it happened. dropsMap counts the events the eBPF side
+// lost, which are logged.
+func Run(
+	ctx context.Context,
+	enterProgram *ebpf.Program,
+	exitProgram *ebpf.Program,
+	ebpfMap *ebpf.Map,
+	dropsMap *ebpf.Map,
+) iter.Seq2[*tracing_service.EventResult, error] {
 	return func(yield func(*tracing_service.EventResult, error) bool) {
-		if program == nil {
-			yield(nil, altshiftErrors.NewWithTrace(nil_error.New("program")))
+		if enterProgram == nil {
+			yield(nil, altshiftErrors.NewWithTrace(nil_error.New("enter program")))
+			return
+		}
+
+		if exitProgram == nil {
+			yield(nil, altshiftErrors.NewWithTrace(nil_error.New("exit program")))
 			return
 		}
 
@@ -121,13 +141,71 @@ func Run(ctx context.Context, program *ebpf.Program, ebpfMap *ebpf.Map) iter.Seq
 			return
 		}
 
+		exitLink, err := link.Tracepoint("syscalls", "sys_exit_execve", exitProgram, nil)
+		if err != nil {
+			yield(nil, altshiftErrors.NewWithTrace(fmt.Errorf("link tracepoint: %w", err)))
+			return
+		}
+		defer func() {
+			if err := exitLink.Close(); err != nil {
+				slog.WarnContext(
+					altshiftContext.WithError(ctx, altshiftErrors.NewWithTrace(fmt.Errorf("tracepoint link close: %w", err), exitLink)),
+					"An error occurred when closing a tracepoint link.",
+				)
+			}
+		}()
+
 		var mu sync.Mutex
 		receiverCtx, cancelReceiver := context.WithCancel(ctx)
 		defer cancelReceiver()
 
-		err := tracing.RunTracepointMapReceiver(
+		lookups := newCollapser()
+		stopped := false
+
+		// emit yields results until the consumer stops; the caller holds mu.
+		emit := func(results []*tracing_service.EventResult) {
+			for _, result := range results {
+				if stopped || !yield(result, nil) {
+					stopped = true
+					cancelReceiver()
+					return
+				}
+			}
+		}
+
+		// A lookup no later exec ends is a failure once its window has passed, which on a quiet host only the
+		// clock can tell. The same loop reports execve events the kernel side lost.
+		expiryDone := make(chan struct{})
+		var expiryWaitGroup sync.WaitGroup
+		expiryWaitGroup.Go(func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			drops := newDropCounter(dropsMap)
+			for tick := 1; ; tick++ {
+				select {
+				case <-expiryDone:
+					return
+				case now := <-ticker.C:
+					mu.Lock()
+					if !stopped {
+						emit(lookups.expire(now, false))
+					}
+					mu.Unlock()
+					if tick%60 == 0 {
+						drops.report(ctx)
+					}
+				}
+			}
+		})
+		stopExpiry := func() {
+			close(expiryDone)
+			expiryWaitGroup.Wait()
+		}
+
+		// In order: the collapser relies on a process's attempts arriving as it made them.
+		err = tracing.RunTracepointOrderedMapReceiver(
 			receiverCtx,
-			program,
+			enterProgram,
 			"syscalls",
 			"sys_enter_execve",
 			ebpfMap,
@@ -155,27 +233,86 @@ func Run(ctx context.Context, program *ebpf.Program, ebpfMap *ebpf.Map) iter.Seq
 				if err := EnrichWithExecveEvent(base, event); err != nil {
 					mu.Lock()
 					defer mu.Unlock()
-					yield(nil, fmt.Errorf("enrich with execve event: %w", err))
+					if !stopped {
+						yield(nil, fmt.Errorf("enrich with execve event: %w", err))
+						stopped = true
+					}
 					cancelReceiver()
 					return
 				}
 
 				mu.Lock()
 				defer mu.Unlock()
-				select {
-				case <-receiverCtx.Done():
+				if receiverCtx.Err() != nil {
 					return
-				default:
-					if !yield(&tracing_service.EventResult{Base: base}, nil) {
-						cancelReceiver()
-						return
-					}
 				}
+				emit(lookups.add(&attempt{
+					result:     &tracing_service.EventResult{Base: base},
+					threadId:   event.ThreadId,
+					executable: base.Process.Executable,
+					errno:      errnoOf(event.ReturnValue),
+					receivedAt: time.Now(),
+				}))
 			},
 		)
+		stopExpiry()
 
+		// The receiver returns once tracing stops: the lookups still waiting then get no exec that worked.
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped {
+			return
+		}
 		if err != nil {
 			yield(nil, fmt.Errorf("run tracing map receiver: %w", err))
+			stopped = true
+			return
 		}
+		emit(lookups.expire(time.Now(), true))
+	}
+}
+
+// dropCounter reports the execve events the eBPF side counted as lost, by where they were lost.
+type dropCounter struct {
+	ebpfMap  *ebpf.Map
+	reported [3]uint64
+}
+
+// The places the eBPF side counts a lost execve event, by index in the execve_drops map.
+var dropPlaces = [3]string{"stage", "evicted", "ringbuf"}
+
+func newDropCounter(ebpfMap *ebpf.Map) *dropCounter {
+	return &dropCounter{ebpfMap: ebpfMap}
+}
+
+// report logs a warning when events have been lost since the last report.
+func (d *dropCounter) report(ctx context.Context) {
+	if d == nil || d.ebpfMap == nil {
+		return
+	}
+
+	var lost []any
+	for index := range dropPlaces {
+		var perCpu []uint64
+		if err := d.ebpfMap.Lookup(uint32(index), &perCpu); err != nil {
+			slog.WarnContext(
+				altshiftContext.WithError(ctx, altshiftErrors.NewWithTrace(fmt.Errorf("ebpf map lookup: %w", err), index)),
+				"The lost execve events could not be read.",
+			)
+			return
+		}
+
+		var total uint64
+		for _, count := range perCpu {
+			total += count
+		}
+		if total > d.reported[index] {
+			lost = append(lost, slog.Uint64(dropPlaces[index], total-d.reported[index]))
+			d.reported[index] = total
+		}
+	}
+
+	if len(lost) > 0 {
+		slog.WarnContext(ctx, "execve events were lost on the kernel side.", slog.Group("tracing", slog.Group("execve", slog.Group("lost", lost...))))
 	}
 }

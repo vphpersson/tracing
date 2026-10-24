@@ -46,12 +46,17 @@ struct execve_event {
 
     u32 process_id;
     u32 parent_process_id;
+    // The calling thread: a process's lookups are only one lookup per thread.
+    u32 thread_id;
     u8 process_title[TASK_COMM_LEN];
 
 	u8  filename[ARGSIZE];
 	u8  argv[ARGLEN][ARGSIZE];
 	// set to ARGLEN + 1 if there were more than ARGLEN arguments
 	u32 argc;
+	// What execve returned: 0, or a negative errno such as -ENOENT for each
+	// PATH entry an execvp-style lookup tried before the one that worked.
+	s64 return_value;
 
     u8 parent_executable_name[EXE_NAME_LEN];
     u8 parent_command_line[CMDLINE_LEN];
@@ -66,15 +71,51 @@ static struct execve_event zero_execve_event SEC(".rodata") = {
 
     .process_id = 0,
     .parent_process_id = 0,
+    .thread_id = 0,
     .process_title = {0},
 
     .filename = {0},
     .argv = {},
     .argc = 0,
+    .return_value = 0,
 
     .parent_executable_name = {0},
     .parent_command_line = {0},
 };
+
+// An execve call between entry and exit, by calling task. The arguments can
+// only be read on entry and the result only on exit, so the event waits here.
+// The task is the same at both ends even when a non-leader thread's exec takes
+// over the leader's process ID. LRU so an entry whose exit was never seen is
+// evicted rather than kept; an LRU map keeps part of its entries reserved per
+// CPU, so it is sized well above the execs expected in flight at once (each
+// entry is ~34 KB, preallocated).
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, u64);
+    __type(value, struct execve_event);
+    __uint(max_entries, 1024);
+} pending_execve_events SEC(".maps");
+
+// execve events lost, per CPU, by where: the call could not be staged, its
+// staged entry was gone by its exit, or the ring buffer was full.
+#define EXECVE_DROP_STAGE 0
+#define EXECVE_DROP_EVICTED 1
+#define EXECVE_DROP_RINGBUF 2
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, 3);
+} execve_drops SEC(".maps");
+
+static __always_inline void count_execve_drop(u32 where) {
+    u64 *count = bpf_map_lookup_elem(&execve_drops, &where);
+    if (count) {
+        (*count)++;
+    }
+}
 
 struct exec_info {
 	u16 common_type;
@@ -89,21 +130,34 @@ struct exec_info {
 	const u8 *const *envp;
 };
 
+struct exec_exit_info {
+	u16 common_type;
+	u8 common_flags;
+	u8 common_preempt_count;
+	s32 common_pid;
+
+	s32 syscall_nr;
+	u32 pad;
+	s64 ret;
+};
+
 SEC("tracepoint/syscalls/sys_enter_execve")
 s32 enter_execve(struct exec_info *execve_ctx) {
     u64 timestamp_ns = bpf_ktime_get_boot_ns();
 
-    struct execve_event *event;
-    event = bpf_ringbuf_reserve(&execve_events, sizeof(struct execve_event), 0);
-    if (!event) {
+    u64 task_key = (u64) bpf_get_current_task();
+    if (bpf_map_update_elem(&pending_execve_events, &task_key, &zero_execve_event, BPF_ANY)) {
+        count_execve_drop(EXECVE_DROP_STAGE);
         return 1;
     }
 
-    s32 ret = bpf_probe_read_kernel(event, sizeof(*event), &zero_execve_event);
-    if (ret) {
-        bpf_ringbuf_discard(event, 0);
+    struct execve_event *event = bpf_map_lookup_elem(&pending_execve_events, &task_key);
+    if (!event) {
+        count_execve_drop(EXECVE_DROP_STAGE);
         return 1;
     }
+
+    s32 ret = 0;
 
     event->timestamp_ns = timestamp_ns;
 
@@ -111,7 +165,9 @@ s32 enter_execve(struct exec_info *execve_ctx) {
     event->user_id = (u32) uid_gid;
     event->group_id = uid_gid >> 32;
 
-    event->process_id = bpf_get_current_pid_tgid() >> 32;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    event->process_id = pid_tgid >> 32;
+    event->thread_id = (u32) pid_tgid;
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     event->parent_process_id = BPF_CORE_READ(task, real_parent, pid);
     bpf_get_current_comm(&event->process_title, TASK_COMM_LEN);
@@ -136,7 +192,8 @@ s32 enter_execve(struct exec_info *execve_ctx) {
     // be more useful in some situations.
     ret = bpf_probe_read_user_str(&event->filename, sizeof(event->filename), execve_ctx->filename);
     if (ret < 0) {
-        bpf_ringbuf_discard(event, 0);
+        bpf_map_delete_elem(&pending_execve_events, &task_key);
+        count_execve_drop(EXECVE_DROP_STAGE);
         return 1;
     }
 
@@ -165,7 +222,26 @@ s32 enter_execve(struct exec_info *execve_ctx) {
     event->argc++;
 
 done:
-    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
+
+// The event of the call, now with its result. After a successful exec this runs
+// in the new program, in the same task.
+SEC("tracepoint/syscalls/sys_exit_execve")
+s32 exit_execve(struct exec_exit_info *exit_ctx) {
+    u64 task_key = (u64) bpf_get_current_task();
+
+    struct execve_event *event = bpf_map_lookup_elem(&pending_execve_events, &task_key);
+    if (!event) {
+        count_execve_drop(EXECVE_DROP_EVICTED);
+        return 0;
+    }
+
+    event->return_value = exit_ctx->ret;
+    if (bpf_ringbuf_output(&execve_events, event, sizeof(*event), 0)) {
+        count_execve_drop(EXECVE_DROP_RINGBUF);
+    }
+    bpf_map_delete_elem(&pending_execve_events, &task_key);
 
     return 0;
 }
